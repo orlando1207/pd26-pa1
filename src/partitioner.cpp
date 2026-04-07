@@ -8,7 +8,8 @@
 #include <cassert>
 #include <vector>
 #include <cmath>
-#include <map>
+#include <climits>
+#include <chrono>
 #include "cell.h"
 #include "net.h"
 #include "partitioner.h"
@@ -66,11 +67,10 @@ void Partitioner::parseInput(fstream& inFile)
     return;
 }
 
-// Helper function by me
-
 // ─── Small utilities ──────────────────────────────────────────────────────────
 
 void Partitioner::_findMaxPinNum() {
+    _maxPinNum = 0;
     for (int i = 0; i < _cellNum; ++i) {
         if (_cellArray[i]->getPinNum() > _maxPinNum)
             _maxPinNum = _cellArray[i]->getPinNum();
@@ -85,7 +85,6 @@ void Partitioner::_findCutSize() {
     }
 }
 
-// Initialise the PartCount fields of every net from the current cell partition
 void Partitioner::_initNetPartCounts() {
     for (int i = 0; i < _netNum; ++i) {
         _netArray[i]->setPartCount(0, 0);
@@ -93,24 +92,25 @@ void Partitioner::_initNetPartCounts() {
     }
     for (int i = 0; i < _cellNum; ++i) {
         int part = _cellArray[i]->getPart();
-        for (int netId : _cellArray[i]->getNetList())
+        const vector<int>& nets = _cellArray[i]->getNetList();
+        for (int netId : nets)
             _netArray[netId]->incPartCount(part);
     }
 }
 
-// ─── Bucket-list helpers ──────────────────────────────────────────────────────
+// ─── Array-based bucket-list helpers ──────────────────────────────────────────
 
-// Remove 'node' (whose current gain key is 'gain') from _bList[part].
 void Partitioner::_removeFromBList(int part, Node* node, int gain) {
+    int idx = gain + _maxPinNum;
     Node* prev = node->getPrev();
     Node* next = node->getNext();
     if (prev == nullptr && next == nullptr) {
-        _bList[part].erase(gain);           // last node in bucket → remove entry
+        _bList[part][idx] = nullptr;
     } else if (prev == nullptr) {
-        _bList[part][gain] = next;          // node was head
+        _bList[part][idx] = next;
         next->setPrev(nullptr);
     } else if (next == nullptr) {
-        prev->setNext(nullptr);             // node was tail
+        prev->setNext(nullptr);
     } else {
         prev->setNext(next);
         next->setPrev(prev);
@@ -119,32 +119,34 @@ void Partitioner::_removeFromBList(int part, Node* node, int gain) {
     node->setNext(nullptr);
 }
 
-// Insert 'node' at the tail of bucket 'gain' in _bList[part].
 void Partitioner::_insertIntoBList(int part, Node* node, int gain) {
+    int idx = gain + _maxPinNum;
     node->setPrev(nullptr);
     node->setNext(nullptr);
-    if (_bList[part].count(gain) == 0) {
-        _bList[part][gain] = node;
-    } else { // insert as the head to save time
-        Node* curr = _bList[part][gain];
-        _bList[part][gain] = node;
-        curr->setPrev(node);
+    if (_bList[part][idx] == nullptr) {
+        _bList[part][idx] = node;
+    } else {
+        Node* curr = _bList[part][idx];
+        _bList[part][idx] = node;
         node->setNext(curr);
+        curr->setPrev(node);
     }
+    if (idx > _maxGainPtr[part])
+        _maxGainPtr[part] = idx;
 }
 
 // ─── Gain initialisation ─────────────────────────────────────────────────────
 
-// Compute the initial gain for cell 'cellId' and insert it into the bucket list.
 void Partitioner::_computeAndInsertGain(int cellId) {
     int from = _cellArray[cellId]->getPart();
     int to   = 1 - from;
     int gain = 0;
-    for (int netId : _cellArray[cellId]->getNetList()) {
+    const vector<int>& nets = _cellArray[cellId]->getNetList();
+    for (int netId : nets) {
         int fc = _netArray[netId]->getPartCount(from);
         int tc = _netArray[netId]->getPartCount(to);
-        if (fc == 1) ++gain;   // moving this cell makes the net critical from F-side → cut decreases
-        if (tc == 0) --gain;   // net entirely on F-side; moving adds a cut
+        if (fc == 1) ++gain;
+        if (tc == 0) --gain;
     }
     _cellArray[cellId]->setGain(gain);
     _insertIntoBList(from, _cellArray[cellId]->getNode(), gain);
@@ -152,20 +154,17 @@ void Partitioner::_computeAndInsertGain(int cellId) {
 
 // ─── Gain propagation after a move ──────────────────────────────────────────
 
-// Standard FM gain-update rules applied to neighbours of the cell that just
-// moved from 'from' to 'to'.  This is called BEFORE updating the net's
-// PartCount, using the original counts (before the move).
 void Partitioner::_updateNeighborGains(int movedCellId, int from, int to) {
-    for (int netId : _cellArray[movedCellId]->getNetList()) {
-        int fc = _netArray[netId]->getPartCount(from);   // count BEFORE move
-        int tc = _netArray[netId]->getPartCount(to);     // count BEFORE move
+    const vector<int>& nets = _cellArray[movedCellId]->getNetList();
+    for (int netId : nets) {
+        int fc = _netArray[netId]->getPartCount(from);
+        int tc = _netArray[netId]->getPartCount(to);
+        const vector<int>& cells = _netArray[netId]->getCellList();
 
-        // ── Step 1: rules based on TO side BEFORE the move ──────────────────
         if (tc == 0) {
-            // The net had no cell on the TO side; every free cell gets +1
-            for (int cid : _netArray[netId]->getCellList()) {
+            for (int cid : cells) {
+                if (cid == movedCellId) continue;
                 if (_cellArray[cid]->getLock()) continue;
-                if (cid == movedCellId) continue;   // skip the cell that just moved
                 int part = _cellArray[cid]->getPart();
                 int oldGain = _cellArray[cid]->getGain();
                 _removeFromBList(part, _cellArray[cid]->getNode(), oldGain);
@@ -173,9 +172,7 @@ void Partitioner::_updateNeighborGains(int movedCellId, int from, int to) {
                 _insertIntoBList(part, _cellArray[cid]->getNode(), oldGain + 1);
             }
         } else if (tc == 1) {
-            // The net will become critical on the TO side after the move;
-            // only the single cell currently on the TO side (if free) gets -1
-            for (int cid : _netArray[netId]->getCellList()) {
+            for (int cid : cells) {
                 if (_cellArray[cid]->getLock()) continue;
                 if (_cellArray[cid]->getPart() != to) continue;
                 int oldGain = _cellArray[cid]->getGain();
@@ -186,17 +183,14 @@ void Partitioner::_updateNeighborGains(int movedCellId, int from, int to) {
             }
         }
 
-        // ── Step 2: update the net's part counts ────────────────────────────
         _netArray[netId]->decPartCount(from);
         _netArray[netId]->incPartCount(to);
-        fc = _netArray[netId]->getPartCount(from);   // count AFTER move
+        fc = _netArray[netId]->getPartCount(from);
 
-        // ── Step 3: rules based on FROM side AFTER the move ─────────────────
         if (fc == 0) {
-            // The net now has no cell on the FROM side; every free cell gets -1
-            for (int cid : _netArray[netId]->getCellList()) {
+            for (int cid : cells) {
+                if (cid == movedCellId) continue;
                 if (_cellArray[cid]->getLock()) continue;
-                if (cid == movedCellId) continue;   // skip the cell that just moved
                 int part = _cellArray[cid]->getPart();
                 int oldGain = _cellArray[cid]->getGain();
                 _removeFromBList(part, _cellArray[cid]->getNode(), oldGain);
@@ -204,9 +198,7 @@ void Partitioner::_updateNeighborGains(int movedCellId, int from, int to) {
                 _insertIntoBList(part, _cellArray[cid]->getNode(), oldGain - 1);
             }
         } else if (fc == 1) {
-            // The net is now critical on the FROM side;
-            // the single remaining cell on FROM side (if free) gets +1
-            for (int cid : _netArray[netId]->getCellList()) {
+            for (int cid : cells) {
                 if (_cellArray[cid]->getLock()) continue;
                 if (_cellArray[cid]->getPart() != from) continue;
                 int oldGain = _cellArray[cid]->getGain();
@@ -221,7 +213,6 @@ void Partitioner::_updateNeighborGains(int movedCellId, int from, int to) {
 
 // ─── Max-gain cell selection ─────────────────────────────────────────────────
 
-// Whether moving a cell from partition 'from' would keep BOTH sides balanced.
 bool Partitioner::_canMoveTo(int from, int lowerBound, int upperBound) const {
     int nextFrom = _partSize[from] - 1;
     int nextTo   = _partSize[1 - from] + 1;
@@ -229,8 +220,6 @@ bool Partitioner::_canMoveTo(int from, int lowerBound, int upperBound) const {
             nextTo   >= lowerBound && nextTo   <= upperBound);
 }
 
-// Scan both bucket lists (highest gain first) and set _maxGainCell to the
-// best free, balanced candidate.  Sets _maxGainCell = nullptr if none exists.
 void Partitioner::_pickMaxGainCell() {
     int lowerBound = (int)ceil((1.0 - _bFactor) / 2.0 * _cellNum);
     int upperBound = (int)floor((1.0 + _bFactor) / 2.0 * _cellNum);
@@ -239,120 +228,142 @@ void Partitioner::_pickMaxGainCell() {
     int bestGain = -_maxPinNum - 1;
 
     for (int part = 0; part <= 1; ++part) {
-        if (_bList[part].empty()) continue;
         if (!_canMoveTo(part, lowerBound, upperBound)) continue;
 
-        // map is ascending; highest gain is at rbegin
-        auto it = _bList[part].rbegin();
-        if (it->first > bestGain) {
-            bestGain     = it->first;
-            _maxGainCell = it->second;
+        while (_maxGainPtr[part] >= 0 && _bList[part][_maxGainPtr[part]] == nullptr)
+            --_maxGainPtr[part];
+
+        if (_maxGainPtr[part] < 0) continue;
+
+        int gain = _maxGainPtr[part] - _maxPinNum;
+        if (gain > bestGain) {
+            bestGain     = gain;
+            _maxGainCell = _bList[part][_maxGainPtr[part]];
         }
     }
 }
 
 // ─── Per-pass reset ──────────────────────────────────────────────────────────
 
-// Unlock all cells, clear bucket lists, recompute gains, ready for a new pass.
 void Partitioner::_resetPass() {
     for (int i = 0; i < _cellNum; ++i) {
         _cellArray[i]->unlock();
         _cellArray[i]->getNode()->setPrev(nullptr);
         _cellArray[i]->getNode()->setNext(nullptr);
     }
-    _bList[0].clear();
-    _bList[1].clear();
+    fill(_bList[0].begin(), _bList[0].end(), nullptr);
+    fill(_bList[1].begin(), _bList[1].end(), nullptr);
+    _maxGainPtr[0] = -1;
+    _maxGainPtr[1] = -1;
     _unlockNum[0] = _partSize[0];
     _unlockNum[1] = _partSize[1];
 
-    // Recompute net part counts from current cell partition
     _initNetPartCounts();
 
-    // Recompute gains and rebuild bucket lists
     for (int i = 0; i < _cellNum; ++i)
         _computeAndInsertGain(i);
 }
 
-// ─── Public interface ─────────────────────────────────────────────────────────
+// ─── Init with a given seed ──────────────────────────────────────────────────
 
-void Partitioner::init() {
-    // Place first half of cells in partition 0, rest in partition 1
+void Partitioner::init(int seed) {
     int k = _cellNum / 2;
     _partSize[0] = k;
     _partSize[1] = _cellNum - k;
-    /*
-    // sequential assign
-    for (int i = 0; i < _cellNum; ++i)
-        _cellArray[i]->setPart(i < k ? 0 : 1);
-    */
 
-    // try other partition method 
-    // random shuffle and assign
-    random_device rd;
-    mt19937 rng(rd());
-
+    mt19937 rng(seed);
     vector<int> cellidx(_cellNum);
     iota(cellidx.begin(), cellidx.end(), 0);
-    
     shuffle(cellidx.begin(), cellidx.end(), rng);
     for (int i = 0; i < _cellNum; ++i) {
         int idx = cellidx[i];
-        _cellArray[idx]->setPart(i < k ? 0 : 1);    
+        _cellArray[idx]->setPart(i < k ? 0 : 1);
     }
 
-    _findMaxPinNum();
+    _prepareForFM();
+}
+
+// Perturb best partition: swap a fraction of cells between sides
+void Partitioner::_initFromPerturb(const vector<bool>& bestPart,
+                                    int bestPS0, int bestPS1,
+                                    int seed, double ratio) {
+    for (int i = 0; i < _cellNum; ++i)
+        _cellArray[i]->setPart(bestPart[i]);
+    _partSize[0] = bestPS0;
+    _partSize[1] = bestPS1;
+
+    vector<int> side0, side1;
+    side0.reserve(_partSize[0]);
+    side1.reserve(_partSize[1]);
+    for (int i = 0; i < _cellNum; ++i) {
+        if (_cellArray[i]->getPart() == 0) side0.push_back(i);
+        else side1.push_back(i);
+    }
+
+    mt19937 rng(seed);
+    shuffle(side0.begin(), side0.end(), rng);
+    shuffle(side1.begin(), side1.end(), rng);
+
+    int swapCount = max(1, (int)(min((int)side0.size(), (int)side1.size()) * ratio));
+    for (int i = 0; i < swapCount; ++i) {
+        _cellArray[side0[i]]->setPart(1);
+        _cellArray[side1[i]]->setPart(0);
+    }
+
+    _prepareForFM();
+}
+
+// Common setup after cell partition is set
+void Partitioner::_prepareForFM() {
     _initNetPartCounts();
     _findCutSize();
 
-    // Build initial bucket lists
-    _bList[0].clear();
-    _bList[1].clear();
+    fill(_bList[0].begin(), _bList[0].end(), nullptr);
+    fill(_bList[1].begin(), _bList[1].end(), nullptr);
+    _maxGainPtr[0] = -1;
+    _maxGainPtr[1] = -1;
+
+    for (int i = 0; i < _cellNum; ++i) {
+        _cellArray[i]->unlock();
+        _cellArray[i]->getNode()->setPrev(nullptr);
+        _cellArray[i]->getNode()->setNext(nullptr);
+    }
     for (int i = 0; i < _cellNum; ++i)
         _computeAndInsertGain(i);
 
     _unlockNum[0] = _partSize[0];
     _unlockNum[1] = _partSize[1];
-    _pickMaxGainCell();
 }
 
-void Partitioner::partition() {
-    init();
+// ─── Single FM run (multiple passes until no improvement) ────────────────────
 
-    int lowerBound = (int)ceil((1.0 - _bFactor) / 2.0 * _cellNum);
-    int upperBound = (int)floor((1.0 + _bFactor) / 2.0 * _cellNum);
-
+void Partitioner::_runFM() {
     while (true) {
-        // ── Start of a new FM pass ───────────────────────────────────────────
         _moveStack.clear();
         _accGain    = 0;
         _maxAccGain = 0;
         _moveNum    = 0;
         _bestMoveNum = 0;
 
-        // Move cells one at a time until all are locked or no valid move exists
         while (true) {
             _pickMaxGainCell();
-            if (_maxGainCell == nullptr) break;   // no balanced candidate
+            if (_maxGainCell == nullptr) break;
 
             int cellId = _maxGainCell->getId();
             int from   = _cellArray[cellId]->getPart();
             int to     = 1 - from;
             int gain   = _cellArray[cellId]->getGain();
 
-            // Remove from bucket list and lock
             _removeFromBList(from, _maxGainCell, gain);
             _cellArray[cellId]->lock();
 
-            // Update neighbour gains and net counts BEFORE changing the cell's partition
             _updateNeighborGains(cellId, from, to);
 
-            // Move the cell
             _cellArray[cellId]->move();
             _partSize[from]--;
             _partSize[to]++;
             --_unlockNum[from];
 
-            // Record this move
             _moveStack.push_back(cellId);
             ++_moveNum;
             _accGain += gain;
@@ -362,10 +373,8 @@ void Partitioner::partition() {
             }
         }
 
-        // ── No improvement in this pass → stop ──────────────────────────────
         if (_maxAccGain <= 0 || _bestMoveNum == 0) break;
 
-        // ── Roll back moves after the best prefix ────────────────────────────
         for (int i = _moveNum - 1; i >= _bestMoveNum; --i) {
             int cellId = _moveStack[i];
             int curPart = _cellArray[cellId]->getPart();
@@ -374,17 +383,84 @@ void Partitioner::partition() {
             _partSize[1 - curPart]++;
         }
 
-        // Update cut size by the accumulated gain of the kept moves
         _cutSize -= _maxAccGain;
-
         ++_iterNum;
 
-        // Prepare for the next pass
         _resetPass();
     }
 }
 
-// End of helper function by me
+// ─── Public interface: multi-restart FM ──────────────────────────────────────
+
+void Partitioner::partition() {
+    _findMaxPinNum();
+
+    int bucketSize = 2 * _maxPinNum + 1;
+    _bList[0].assign(bucketSize, nullptr);
+    _bList[1].assign(bucketSize, nullptr);
+
+    _moveStack.reserve(_cellNum);
+
+    int bestCutSize = INT_MAX;
+    vector<bool> bestPartition(_cellNum);
+    int bestPartSize[2] = {0, 0};
+
+    auto startTime = chrono::steady_clock::now();
+    double timeLimitSec = 280.0;
+    int patience = 20;       // stop after this many restarts without improvement
+    int noImproveCount = 0;
+
+    random_device rd;
+    int baseSeed = rd();
+
+    for (int restart = 0; ; ++restart) {
+        // Time check after first run
+        if (restart >= 1) {
+            auto now = chrono::steady_clock::now();
+            double elapsed = chrono::duration<double>(now - startTime).count();
+            if (elapsed > timeLimitSec) break;
+            // Estimate if next run would exceed limit
+            double avgTime = elapsed / restart;
+            if (elapsed + avgTime * 1.2 > timeLimitSec) break;
+        }
+        // Patience check
+        if (noImproveCount >= patience) break;
+
+        _iterNum = 0;
+
+        // First 3 restarts: random. After that, alternate: 75% perturb, 25% random
+        if (restart < 3 || bestCutSize == INT_MAX) {
+            init(baseSeed + restart);
+        } else if ((restart % 4) == 0) {
+            init(baseSeed + restart);
+        } else {
+            double ratio = 0.03 + 0.02 * (noImproveCount / 5);  // escalate perturbation
+            if (ratio > 0.15) ratio = 0.15;
+            _initFromPerturb(bestPartition, bestPartSize[0], bestPartSize[1],
+                             baseSeed + restart, ratio);
+        }
+        _runFM();
+
+        if (_cutSize < bestCutSize) {
+            bestCutSize = _cutSize;
+            bestPartSize[0] = _partSize[0];
+            bestPartSize[1] = _partSize[1];
+            for (int i = 0; i < _cellNum; ++i)
+                bestPartition[i] = _cellArray[i]->getPart();
+            noImproveCount = 0;
+        } else {
+            ++noImproveCount;
+        }
+    }
+
+    _cutSize = bestCutSize;
+    _partSize[0] = bestPartSize[0];
+    _partSize[1] = bestPartSize[1];
+    for (int i = 0; i < _cellNum; ++i)
+        _cellArray[i]->setPart(bestPartition[i]);
+}
+
+// ─── Reporting ───────────────────────────────────────────────────────────────
 
 void Partitioner::printSummary() const
 {
@@ -405,7 +481,7 @@ void Partitioner::reportNet() const
     cout << "Number of nets: " << _netNum << endl;
     for (size_t i = 0, end_i = _netArray.size(); i < end_i; ++i) {
         cout << setw(8) << _netArray[i]->getName() << ": ";
-        vector<int> cellList = _netArray[i]->getCellList();
+        const vector<int>& cellList = _netArray[i]->getCellList();
         for (size_t j = 0, end_j = cellList.size(); j < end_j; ++j) {
             cout << setw(8) << _cellArray[cellList[j]]->getName() << " ";
         }
@@ -419,7 +495,7 @@ void Partitioner::reportCell() const
     cout << "Number of cells: " << _cellNum << endl;
     for (size_t i = 0, end_i = _cellArray.size(); i < end_i; ++i) {
         cout << setw(8) << _cellArray[i]->getName() << ": ";
-        vector<int> netList = _cellArray[i]->getNetList();
+        const vector<int>& netList = _cellArray[i]->getNetList();
         for (size_t j = 0, end_j = netList.size(); j < end_j; ++j) {
             cout << setw(8) << _netArray[netList[j]]->getName() << " ";
         }

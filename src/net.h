@@ -15,9 +15,9 @@ public:
     ~Net()  { }
 
     // basic access methods
-    string getName()           const { return _name; }
+    const string& getName()    const { return _name; }
     int getPartCount(int part) const { return _partCount[part]; }
-    vector<int> getCellList()  const { return _cellList; }
+    const vector<int>& getCellList() const { return _cellList; }
 
     // set functions
     void setName(const string name) { _name = name; }

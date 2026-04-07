@@ -1,0 +1,16 @@
+# compiled binary
+bin/fm
+
+# output files
+bin/output_*.dat
+outputs/
+
+# evaluator binaries and results
+evaluator/checker
+evaluator/result_*.dat
+
+# object files
+*.o
+
+# record.txt
+record.txt

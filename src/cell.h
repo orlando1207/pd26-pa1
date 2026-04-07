@@ -46,9 +46,9 @@ public:
     bool getPart() const    { return _part; }
     bool getLock() const    { return _lock; }
     Node* getNode() const   { return _node; }
-    string getName() const  { return _name; }
+    const string& getName() const  { return _name; }
     int getFirstNet() const { return _netList[0]; }
-    vector<int> getNetList() const  { return _netList; }
+    const vector<int>& getNetList() const  { return _netList; }
 
     // Set functions
     void setNode(Node* node)        { _node = node; }

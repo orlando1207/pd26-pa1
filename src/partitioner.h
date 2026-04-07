@@ -3,7 +3,8 @@
 
 #include <fstream>
 #include <vector>
-#include <map>
+#include <unordered_map>
+#include <chrono>
 #include "cell.h"
 #include "net.h"
 using namespace std;
@@ -18,6 +19,8 @@ public:
         parseInput(inFile);
         _partSize[0] = 0;
         _partSize[1] = 0;
+        _maxGainPtr[0] = -1;
+        _maxGainPtr[1] = -1;
     }
     ~Partitioner() {
         clear();
@@ -32,7 +35,7 @@ public:
 
     // public interface
     void parseInput(fstream& inFile);
-    void init();
+    void init(int seed);
     void partition();
 
     // member functions about reporting
@@ -51,9 +54,13 @@ private:
     Node*               _maxGainCell;   // pointer to max gain cell
     vector<Net*>        _netArray;      // net array of the circuit
     vector<Cell*>       _cellArray;     // cell array of the circuit
-    map<int, Node*>     _bList[2];      // bucket list of partition A(0) and B(1)
-    map<string, int>    _netName2Id;    // mapping from net name to id
-    map<string, int>    _cellName2Id;   // mapping from cell name to id
+
+    // Array-based bucket list: index = gain + _maxPinNum
+    vector<Node*>       _bList[2];      // bucket list of partition A(0) and B(1)
+    int                 _maxGainPtr[2]; // current max occupied index per partition
+
+    unordered_map<string, int>    _netName2Id;    // mapping from net name to id
+    unordered_map<string, int>    _cellName2Id;   // mapping from cell name to id
 
     int                 _accGain;       // accumulative gain
     int                 _maxAccGain;    // maximum accumulative gain
@@ -77,6 +84,10 @@ private:
     void _pickMaxGainCell();
     void _resetPass();
     bool _canMoveTo(int from, int lowerBound, int upperBound) const;
+    void _runFM();
+    void _prepareForFM();
+    void _initFromPerturb(const vector<bool>& bestPart, int bestPS0, int bestPS1,
+                          int seed, double ratio);
 };
 
 #endif  // PARTITIONER_H
