@@ -9,6 +9,27 @@
 #include "net.h"
 using namespace std;
 
+// ─── Multilevel coarsening data structures ───────────────────────────────────
+
+struct CoarseLevel {
+    // For each original cell, which cluster does it belong to at this level
+    vector<int> cellToCluster;
+    int numClusters;
+
+    // Coarsened hypergraph
+    // clusterNets[c] = list of coarsened net IDs that cluster c touches
+    vector<vector<int>> clusterNets;
+    // coarseNet[n] = list of cluster IDs on net n
+    vector<vector<int>> coarseNetClusters;
+    int numCoarseNets;
+
+    // Cluster weights (number of original cells in cluster)
+    vector<int> clusterWeight;
+
+    // For uncoarsening: cluster -> list of original cell IDs
+    vector<vector<int>> clusterCells;
+};
+
 class Partitioner
 {
 public:
@@ -84,10 +105,30 @@ private:
     void _pickMaxGainCell();
     void _resetPass();
     bool _canMoveTo(int from, int lowerBound, int upperBound) const;
-    void _runFM();
+    void _runFM(int maxPasses = 0);  // 0 = unlimited passes
     void _prepareForFM();
     void _initFromPerturb(const vector<bool>& bestPart, int bestPS0, int bestPS1,
                           int seed, double ratio);
+
+    // ─── Multilevel helpers ──────────────────────────────────────────────────
+    // Build one coarsening level using heavy-edge matching
+    CoarseLevel _coarsen(const vector<int>& prevMapping, int prevClusters,
+                         const vector<vector<int>>& prevClusterNets,
+                         const vector<vector<int>>& prevNetClusters,
+                         int prevNumNets,
+                         const vector<int>& prevClusterWeight,
+                         int seed);
+
+    // Run FM on a coarsened graph (weighted cells)
+    // If initPart is non-null, use it as initial partition; otherwise random
+    void _runCoarseFM(CoarseLevel& level, int seed,
+                      const vector<int>* initPart = nullptr, int maxPasses = 15);
+
+    // Project partition from coarse level to fine level and refine with FM
+    void _projectAndRefine(CoarseLevel& coarseLevel, CoarseLevel& fineLevel);
+
+    // Full multilevel partition
+    void _multilevelPartition(int seed);
 };
 
 #endif  // PARTITIONER_H
